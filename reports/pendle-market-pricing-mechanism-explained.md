@@ -326,6 +326,197 @@ Market 读取状态时会从 factory 取一个「按 router 维度」的 fee ove
 
 ---
 
+## 9. 你问的几个“卡点”一次说清（套利研究最常踩）
+
+### 9.1 `p = (totalPt - x)/(totalPt + totalAsset)`：这里的 `x` 到底是什么？
+
+合约里 `x` 就是 `netPtToAccount`（PT 这条腿的交易量）：
+- `x > 0`：用户买 PT（从池子拿走 PT）
+- `x < 0`：用户卖 PT（把 PT 给池子）
+
+`p` 只是拿来喂给 logit 曲线的“库存坐标”，它不是资产结算本身；真实结算在 `calcTrade()` 里是：
+
+- `preFeeAssetToAccount = -(x / E_trade)`
+
+也就是说：**用户应付/应收的 asset 并不是 `x`，而是 `x` 除以当次算出来的 `exchangeRate`**（再叠加 fee 与四舍五入）。
+
+对应代码：
+- `p`：`pendle-core-v2-public/contracts/core/Market/MarketMathCore.sol:326`
+- `preFeeAssetToAccount`：`pendle-core-v2-public/contracts/core/Market/MarketMathCore.sol:234`
+
+### 9.2 为什么 `logit(p)` 可以化简成 `ln((totalPt-x)/(totalAsset+x))`，但还“不像应付/应收”？
+
+因为 `logit(p)` 本来就是：
+
+- `logit(p) = ln(p/(1-p))`
+
+而 `p = (P-x)/(P+A)`，所以：
+- `1-p = (A+x)/(P+A)`
+- `p/(1-p) = (P-x)/(A+x)`
+
+这里的 `A+x` 只是来自 `1-p` 的代数补集（同一个分母 `P+A`），它**不是**“交易后池子里真实的 asset 储备”。真实的 asset 储备变化是：
+
+- `A_after = A - netAssetToAccount`
+- 买 PT 时 `netAssetToAccount < 0` ⇒ `A_after = A + asset_in`
+
+直觉上你可以把 `A+x` 理解成一个“虚拟坐标”：
+- 如果 PT 永远 1:1（`E=1`）且无手续费，买 `x` PT 确实应付 `x` asset，此时 `A_after = A + x`，`A+x` 就会等于真实变化。
+- Pendle 选择用它当坐标，是为了让 `E(p)` 显式、单调、便宜可算（否则会出现隐式方程，要在 AMM 里做求根）。
+
+### 9.3 “我买 10 PT，池子拿走 10 PT，我补 10 SY”——这个直觉对吗？
+
+对一半：
+- 池子 PT 的变化确实是 `-10`（这就是 `x`）。
+- 但你补的 SY（换成 asset）通常不是 10，而是大约 `10 / E_trade`，再乘/除 `feeFactor`，并受 rounding 影响。
+
+只有在 `E_trade≈1` 且 fee≈1 时，`asset_in≈x` 才接近成立（通常是“非常接近到期、利率很低”的情形）。
+
+---
+
+## 10. 为什么是 logit 这条曲线？能不能“随手改一下”？
+
+这是“设计选择”，不是数学唯一性；它的工程/金融动机大概是下面几条（对应 `AMM.pdf` 的思路）：
+
+1. **用 `p∈(0,1)` 表示库存结构**：`p = PT/(PT+asset)` 很直观，跨不同规模市场可比。
+2. **logit 把 (0,1) 映射到全实数**：`logit(p)→±∞` 让边界天然“推开”，避免被一把买空。
+3. **logit 在 `x=0` 时等价于 `ln(PT/asset)`**：因为 `logit(PT/(PT+A)) = ln(PT/A)`，有点像“把常见 AMM 的储备比值放到 log 空间”。
+4. **线性映射到 `E` 很好校准**：`E(p) = logit(p)/rateScalar + rateAnchor`，用 `rateScalar` 控斜率，用 `rateAnchor` 让曲线穿过当前隐含利率点。
+5. **配合时间缩放更像利率市场**：隐含利率用 `ln(E)*1y/T` 表达，`rateScalar ∝ 1/T` 是为了让不同到期的“年化敏感度”不要炸裂。
+
+能不能改成你说的 `ln((P-x)/A)` 或别的形式？原则上你当然可以设计别的 AMM 曲线，但它不是“换一行”这么简单，至少要同步重做：
+- `rateAnchor` 的定义与边界检查（`MAX_MARKET_PROPORTION`）；
+- `calcTrade` 的“显式结算”方式（否则可能变成隐式方程）；
+- Router 的 `MarketApproxLibV2`（它默认了价格函数单调且可用当前 `calcTrade` 做内层估值）。
+
+从套利研究角度：**别把它当作某个“必然公式”，把它当作 Pendle 选的一条“库存 → 隐含利率”的定价规则** 更贴近事实。
+
+---
+
+## 11. 合约实现视角：一次 swap 里到底发生了什么？
+
+以 Market 合约里的 `swapSyForExactPt()`（用户用 SY 买固定数量 PT）为例，核心流程是：
+
+1. `market = readState(router=msg.sender)`  
+   - 读 `_storage.totalPt/_storage.totalSy/_storage.lastLnImpliedRate`
+   - 向 factory 读 `treasury / reserveFeePercent / overriddenFee`
+2. `index = YT.newIndex()`（内部读 `YT.pyIndexCurrent()`，本质是 `SY.exchangeRate()`）
+3. `comp = getMarketPreCompute(market, index, now)`  
+   - `T = expiry - now`
+   - `rateScalar = scalarRoot*1y/T`
+   - `totalAsset = syToAsset(totalSy)`
+   - `rateAnchor = E0 - logit(p0)/rateScalar`（`E0 = exp(lastLnImpliedRate*T/1y)`）
+   - `feeRate = exp(lnFeeRateRoot*T/1y)`（可能是 override 后的）
+4. `(netSyToAccount, netSyFee, netSyToReserve) = calcTrade(..., x=netPtToAccount)`
+   - `E_trade = _getExchangeRate(..., x)`（核心 logit 曲线）
+   - `preFeeAssetToAccount = -(x/E_trade)`
+   - 应用 `feeRate` 与 `reserveFeePercent`，得到 `netAssetToAccount/netAssetToReserve`
+   - `asset→sy`：买 PT 时用 `assetToSyUp()`（保证用户付够），卖 PT 用 `assetToSy()`（向下取整）
+5. `_setNewMarketStateTrade(...)`  
+   - 更新 `totalPt/totalSy`
+   - 用新储备反推新的 `lastLnImpliedRate`（供下一笔 trade 重新锚定）
+
+对应代码入口：
+- `readState`：`pendle-core-v2-public/contracts/core/Market/PendleMarketV6.sol:307`
+- `YT.newIndex()`：`pendle-core-v2-public/contracts/core/StandardizedYield/PYIndex.sol:13`
+- `getMarketPreCompute`：`pendle-core-v2-public/contracts/core/Market/MarketMathCore.sol:198`
+- `calcTrade`：`pendle-core-v2-public/contracts/core/Market/MarketMathCore.sol:221`
+
+---
+
+## 12. 哪些参数“部署时定死”，哪些“每笔交易现场算/现场取”？
+
+做套利/模拟时，你最关心的是：哪些东西你必须每次 `eth_call` 读，哪些可以当作常量缓存。
+
+### 12.1 基本不变（Market 部署时就定了）
+
+- `expiry`：到期时间（`pendle-core-v2-public/contracts/core/Market/PendleMarketV6.sol:54`）
+- `scalarRoot`：曲线强度参数（`pendle-core-v2-public/contracts/core/Market/PendleMarketV6.sol:56`）
+- `lnFeeRateRoot`：默认费率根（但可能被 override）（`pendle-core-v2-public/contracts/core/Market/PendleMarketV6.sol:58`）
+- `SY/PT/YT` 地址与 decimals（`pendle-core-v2-public/contracts/core/Market/PendleMarketV6.sol:49`）
+- `initialAnchor`：只在初始化 LP 时用一次（`pendle-core-v2-public/contracts/core/Market/PendleMarketV6.sol:57`）
+
+### 12.2 可能被治理/工厂改（读 `readState(router)` 才知道）
+
+- `treasury`
+- `reserveFeePercent`
+- `overriddenFee`（router 维度的 fee 覆盖）
+
+### 12.3 每笔必须现场读/算（会随交易与时间变化）
+
+- `totalPt / totalSy / lastLnImpliedRate`（Market storage）
+- `pyIndexCurrent`（来自 `YT.pyIndexCurrent()` / `SY.exchangeRate()`）
+- `block.timestamp`（决定 `T = expiry-now`，进而影响 `rateScalar/feeRate/E0`）
+
+### 12.4 每笔现场计算（不用上链读，但必须算）
+
+- `totalAsset = syToAsset(totalSy, pyIndex)`
+- `rateScalar = scalarRoot*1y/T`
+- `rateAnchor = E0 - logit(p0)/rateScalar`
+- `E_trade / PT_price / impliedRate`
+
+---
+
+## 13. 套利研究的“金融直觉框架”：你到底在押什么？
+
+把 PT 当作到期兑付 1 asset 的零息债（discount factor `d`），市场给出的关键量是：
+
+- `E_spot = exchangeRate(PT per asset)`
+- `PT_price_asset d = 1/E_spot`
+- `lnImpliedRate r = ln(E_spot) * 1y / T`
+
+**你在做的其实是利率/收益的判断：**
+- `r` 高 ⇒ `d` 低 ⇒ PT 便宜、YT 贵（市场觉得“未来 yield 很值钱”）
+- `r` 低 ⇒ `d` 高 ⇒ PT 贵、YT 便宜（市场觉得“未来 yield 不值钱/不确定性小”）
+
+### 13.1 你能做的主要套利/价差（按常见难度）
+
+1. **跨场所 PT 价差**：同一个 PT 在 Pendle Market 与别的 DEX/OTC 的价格不同（最直观）。
+2. **跨到期曲线价差**：同一标的不同到期的 PT 隐含利率是否构成合理期限结构（可用 `d(T)` 推 forward rate）。
+3. **YT 的“杠杆效应”与费用放大**：当 `d→1` 时，`Buy YT` 等价于用 `1/(1-d/F)` 放大本金循环，微小的 fee/priceImpact 会被放大成很大的 YT 口径损耗。
+
+### 13.2 “我买 YT 再立刻卖掉”除了 fee 还有损耗吗？
+
+有，且主要来自三类（你做高频/大额时要计入）：
+
+1. **曲线带来的 price impact（哪怕你立刻反向）**：Pendle 不是传统 CFMM 的“严格可逆” invariant，反向交易回到原位时依然会有一个二阶损耗（直觉：曲线 + 重新锚定导致的凸性成本）。小额时它是 `O(size^2)`，会非常小。
+2. **四舍五入/精度**：`assetToSyUp()` 与 `assetToSy()` 的方向性 rounding，会在来回路径上留下 dust。
+3. **Router 近似求解误差**：`approxSwapExactSyForYtV2`/`approxSwapExactYtForSyV2` 有 `eps` 容忍度与迭代上限，极端情况下会留下额外滑点（通常很小）。
+
+如果你把“买卖之间时间相差极短”理解为“同一区块”，那么还可以忽略：
+- `T` 变化（秒级）
+- `pyIndexCurrent` 变化（但某些 SY 会在同区块更新 index，仍然建议你模拟时读实际值）
+
+---
+
+## 14. 进一步阅读（Pendle 自己写的“为什么这样设计”）
+
+本仓库自带 whitepaper（建议顺序）：
+- `pendle-core-v2-public/whitepapers/SY.pdf`：SY 与 index 的定义、奖励/收益的拆分口径
+- `pendle-core-v2-public/whitepapers/PT+YT.pdf`：PT/YT 的金融含义与兑换关系
+- `pendle-core-v2-public/whitepapers/AMM.pdf`：为什么用这种曲线/锚定方式做 AMM
+- `pendle-core-v2-public/whitepapers/LP_Oracle.pdf`：TWAP/oracle 的实现与适用边界
+
+---
+
+## 15. 仓库代码 vs 链上示例 market（0xbE570...）：是不是“完全同一套”？
+
+结论（就“定价机制”而言）：**是同一套机制**，但你会看到一些“版本/封装层”的细节差别：
+
+1. **版本差异**：本仓库主干是 `PendleMarketV6`，而示例 market 地址在主网上跑的是更早的 `PendleMarketV3`（文件组织与接口名不同）。
+2. **核心定价逻辑一致**：关键函数（`getMarketPreCompute` / `calcTrade` / `_getExchangeRate` / `_getRateScalar` / `_getRateAnchor`）的数学结构相同：  
+   - logit 曲线：`E(p)=logit(p)/rateScalar+rateAnchor`  
+   - 时间缩放：`rateScalar ∝ 1/T`、`E0=exp(rT)`  
+   - 期限相关 fee：`feeFactor=exp(lnFeeRateRoot*T)`
+3. **差别主要在“外层工程”**：比如 V6 多了 oracle 观测、gauge 相关逻辑、storage 压缩方式不同；但这些不改变报价公式。
+4. **router fee override 的概念相同**：都是 `readState(router)` 向 factory 查询配置，然后可能覆盖 `lnFeeRateRoot`；只是接口/文件路径不同。
+
+如果你要做“链上精确复现”，建议优先对齐这几件事：
+- **用同一个 router 地址去 `readState(router)`**（否则 fee 会不同）
+- **用同一个区块/时间戳的 `pyIndexCurrent()`**（某些 SY 的 index 会在同区块更新）
+- **确认 market 合约版本（V3/V6）对应的 factory 接口**（字段名可能不同，但语义一致）
+
+---
+
 ## 附录 A：核心公式 ⇄ 代码位置速查
 
 - `totalAsset = syToAsset(totalSy)`：`pendle-core-v2-public/contracts/core/Market/MarketMathCore.sol:205`

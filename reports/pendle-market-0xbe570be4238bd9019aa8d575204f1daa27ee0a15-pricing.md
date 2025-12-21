@@ -98,7 +98,9 @@ SY `getTokensIn()` 表明可用于 mint SY 的 token（本次抓到 3 个）：
 
 `rateScalar = scalarRoot * 1year / T`
 
-含义：离到期越近，`T` 越小，`rateScalar` 越大，价格曲线更“敏感”。
+含义（更精确）：
+- 在 `E(p) = logit(p)/rateScalar + rateAnchor` 里，`rateScalar` 越大，`logit(p)/rateScalar` 的贡献越小 ⇒ **`E(p)` 随库存变化更“平”**。
+- 但隐含利率是 `r = ln(E) * 1year / T`，当 `T` 变小，年化因子 `1/T` 会放大利率变化；因此 Pendle 取 `rateScalar ∝ 1/T` 更多是为了让“年化利率曲线”的敏感度在不同到期下更稳定，而不是让 `E(p)` 本身变得更陡。
 
 ### 3.3 交易定价的核心：logit 曲线
 
@@ -300,4 +302,3 @@ Market 会把 `lnFeeRateRoot` 转换为期限相关的乘数：
    - 本 SY 内 `asdPENDLE_out ≈ SY_out`
 
 > 对大额交易：请用 `MarketMathCore` 的 trade-size `E(y)`（logit 曲线）替代 `E0`，并按 `calcTrade` 的分支处理 fee（买 PT vs 卖 PT），否则误差会逐渐变大。
-
