@@ -279,6 +279,205 @@ def _exchange_rate_curve(
     return E
 
 
+def _simulate_trade_exact_pt(
+    *,
+    total_pt: float,
+    total_asset: float,
+    last_ln_implied_rate: float,
+    scalar_root: float,
+    time_to_expiry_seconds: float,
+    net_pt_to_account: float,
+    fee_factor: float = 1.0,
+    max_market_proportion: float = 0.96,
+) -> tuple[float, float, float, float]:
+    """
+    A small float-based simulator that mirrors the core math in:
+      - MarketMathCore.getMarketPreCompute()
+      - MarketMathCore.calcTrade()  (with fee modeled as a multiplicative factor)
+      - MarketMathCore._setNewMarketStateTrade()
+
+    Returns:
+      (new_total_pt, new_total_asset, new_last_ln_implied_rate, net_asset_to_account)
+
+    Notes:
+    - Ignores SY conversion and rounding (treats totals in "asset units").
+    - Models fee as:
+        buy PT (net_pt_to_account > 0):  asset_in *= fee_factor
+        sell PT (net_pt_to_account < 0): asset_out /= fee_factor
+      which matches the algebraic effect of `feeRate` in `calcTrade()`.
+    """
+
+    if time_to_expiry_seconds <= 0:
+        raise ValueError("time_to_expiry_seconds must be > 0")
+    if total_pt <= 0 or total_asset <= 0:
+        raise ValueError("total_pt and total_asset must be > 0")
+    if fee_factor <= 0:
+        raise ValueError("fee_factor must be > 0")
+
+    one_year = 365 * 86400
+    rate_scalar = scalar_root * one_year / time_to_expiry_seconds
+
+    p0 = total_pt / (total_pt + total_asset)
+    e0 = math.exp(last_ln_implied_rate * time_to_expiry_seconds / one_year)
+    rate_anchor = e0 - _logit(p0) / rate_scalar
+
+    p_trade = (total_pt - net_pt_to_account) / (total_pt + total_asset)
+    if not (0.0 < p_trade < 1.0):
+        raise ValueError(f"invalid p_trade={p_trade}")
+    if p_trade > max_market_proportion:
+        raise ValueError(f"p_trade too high: {p_trade} > {max_market_proportion}")
+
+    exchange_rate_trade = _logit(p_trade) / rate_scalar + rate_anchor
+    if exchange_rate_trade < 1.0:
+        raise ValueError(f"exchange_rate_trade below 1: {exchange_rate_trade}")
+
+    pre_fee_asset_to_account = -(net_pt_to_account / exchange_rate_trade)
+
+    if net_pt_to_account > 0:
+        net_asset_to_account = pre_fee_asset_to_account * fee_factor
+    else:
+        net_asset_to_account = pre_fee_asset_to_account / fee_factor
+
+    new_total_pt = total_pt - net_pt_to_account
+    new_total_asset = total_asset - net_asset_to_account
+
+    if new_total_pt <= 0 or new_total_asset <= 0:
+        raise ValueError("trade leads to non-positive reserves")
+
+    p0_new = new_total_pt / (new_total_pt + new_total_asset)
+    exchange_rate_spot_new = _logit(p0_new) / rate_scalar + rate_anchor
+    if exchange_rate_spot_new < 1.0:
+        raise ValueError(f"exchange_rate_spot_new below 1: {exchange_rate_spot_new}")
+
+    new_last_ln_implied_rate = math.log(exchange_rate_spot_new) * one_year / time_to_expiry_seconds
+
+    return new_total_pt, new_total_asset, new_last_ln_implied_rate, net_asset_to_account
+
+
+def _simulate_roundtrip_loss_bps(
+    *,
+    total_pt: float,
+    total_asset: float,
+    last_ln_implied_rate: float,
+    scalar_root: float,
+    time_to_expiry_seconds: float,
+    trade_pt: float,
+    splits: int,
+    fee_factor: float = 1.0,
+) -> float:
+    """
+    Simulates:
+      buy `trade_pt` PT (exact-out), then sell `trade_pt` PT back (exact-in),
+    each leg split into `splits` equal sub-trades.
+
+    Returns loss in bps of spot-notional (x * PT_price_spot).
+    """
+
+    if splits <= 0:
+        raise ValueError("splits must be >= 1")
+    if trade_pt <= 0:
+        raise ValueError("trade_pt must be > 0")
+
+    one_year = 365 * 86400
+    spot_exchange_rate = math.exp(last_ln_implied_rate * time_to_expiry_seconds / one_year)
+    pt_price_spot = 1.0 / spot_exchange_rate
+    notional = trade_pt * pt_price_spot
+    if notional <= 0:
+        return 0.0
+
+    state = (total_pt, total_asset, last_ln_implied_rate)
+    asset_to_account_total = 0.0
+
+    # Buy PT (netPtToAccount > 0) -> asset_to_account is negative.
+    step = trade_pt / splits
+    for _ in range(splits):
+        new_total_pt, new_total_asset, new_last_ln_implied_rate, net_asset_to_account = _simulate_trade_exact_pt(
+            total_pt=state[0],
+            total_asset=state[1],
+            last_ln_implied_rate=state[2],
+            scalar_root=scalar_root,
+            time_to_expiry_seconds=time_to_expiry_seconds,
+            net_pt_to_account=step,
+            fee_factor=fee_factor,
+        )
+        state = (new_total_pt, new_total_asset, new_last_ln_implied_rate)
+        asset_to_account_total += net_asset_to_account
+
+    # Sell PT back (netPtToAccount < 0) -> asset_to_account is positive.
+    for _ in range(splits):
+        new_total_pt, new_total_asset, new_last_ln_implied_rate, net_asset_to_account = _simulate_trade_exact_pt(
+            total_pt=state[0],
+            total_asset=state[1],
+            last_ln_implied_rate=state[2],
+            scalar_root=scalar_root,
+            time_to_expiry_seconds=time_to_expiry_seconds,
+            net_pt_to_account=-step,
+            fee_factor=fee_factor,
+        )
+        state = (new_total_pt, new_total_asset, new_last_ln_implied_rate)
+        asset_to_account_total += net_asset_to_account
+
+    loss_asset = -asset_to_account_total
+    return loss_asset / notional * 1e4
+
+
+def _simulate_buy_exact_pt_extra_cost_bps(
+    *,
+    total_pt: float,
+    total_asset: float,
+    last_ln_implied_rate: float,
+    scalar_root: float,
+    time_to_expiry_seconds: float,
+    trade_pt: float,
+    splits: int,
+    baseline_splits: int = 1000,
+    fee_factor: float = 1.0,
+) -> float:
+    """
+    Extra cost (bps of spot-notional) from buying `trade_pt` PT in `splits` sub-trades,
+    compared to a fine-grained baseline (`baseline_splits`, as a proxy for the continuous limit).
+
+    This isolates the "endpoint pricing / discretization" effect (not fee), but you can
+    optionally include `fee_factor` to see the total payment shift.
+    """
+
+    if splits <= 0 or baseline_splits <= 0:
+        raise ValueError("splits and baseline_splits must be >= 1")
+    if trade_pt <= 0:
+        raise ValueError("trade_pt must be > 0")
+
+    one_year = 365 * 86400
+    spot_exchange_rate = math.exp(last_ln_implied_rate * time_to_expiry_seconds / one_year)
+    pt_price_spot = 1.0 / spot_exchange_rate
+    notional = trade_pt * pt_price_spot
+    if notional <= 0:
+        return 0.0
+
+    def simulate_cost(n: int) -> float:
+        state = (total_pt, total_asset, last_ln_implied_rate)
+        asset_to_account_total = 0.0
+        step = trade_pt / n
+        for _ in range(n):
+            new_total_pt, new_total_asset, new_last_ln_implied_rate, net_asset_to_account = _simulate_trade_exact_pt(
+                total_pt=state[0],
+                total_asset=state[1],
+                last_ln_implied_rate=state[2],
+                scalar_root=scalar_root,
+                time_to_expiry_seconds=time_to_expiry_seconds,
+                net_pt_to_account=step,
+                fee_factor=fee_factor,
+            )
+            state = (new_total_pt, new_total_asset, new_last_ln_implied_rate)
+            asset_to_account_total += net_asset_to_account
+        return -asset_to_account_total
+
+    cost_splits = simulate_cost(splits)
+    cost_baseline = simulate_cost(baseline_splits)
+
+    extra = cost_splits - cost_baseline
+    return extra / notional * 1e4
+
+
 def _generate_fig1(out_dir: Path) -> None:
     """
     Figure 1: PT price and implied APY as a function of p (inventory proportion),
@@ -503,6 +702,198 @@ def _generate_fig3(out_dir: Path) -> None:
     _write_svg(out_dir / "pendle-fig3-yt-per-sy-vs-ptprice.svg", svg)
 
 
+def _generate_fig4(out_dir: Path) -> None:
+    """
+    Figure 4: compare the non-fee, non-rounding round-trip loss (buy PT then sell back)
+    under different split counts.
+    """
+    py_index = 1.1590929262
+    total_pt = 168_324.7732
+    total_sy = 282_260.1990
+    total_asset = total_sy * py_index
+
+    scalar_root = 10.7165715974
+    last_ln_implied_rate = 0.2103754602
+    time_to_expiry_days = 95.3786
+    time_to_expiry = time_to_expiry_days * 86400
+
+    fracs = _linspace(0.001, 0.50, 220)  # 0.1% to 50% of pool totalPt
+    xs = [f * 100.0 for f in fracs]  # x-axis in %
+
+    split_counts = [1, 5, 10, 50]
+    colors = ["#111827", "#2563EB", "#DC2626", "#059669"]  # gray-900 / blue / red / green
+
+    series_list: list[Series] = []
+    for splits, color in zip(split_counts, colors, strict=True):
+        pts: list[tuple[float, float]] = []
+        for frac, x_pct in zip(fracs, xs, strict=True):
+            trade_pt = total_pt * frac
+            loss_bps = _simulate_roundtrip_loss_bps(
+                total_pt=total_pt,
+                total_asset=total_asset,
+                last_ln_implied_rate=last_ln_implied_rate,
+                scalar_root=scalar_root,
+                time_to_expiry_seconds=time_to_expiry,
+                trade_pt=trade_pt,
+                splits=splits,
+                fee_factor=1.0,
+            )
+            pts.append((x_pct, loss_bps))
+        series_list.append(Series(name=f"splits={splits}", points=pts, color=color))
+
+    y_all = [y for s in series_list for _, y in s.points]
+    y_min, y_max = 0.0, max(y_all)
+    y_pad = y_max * 0.08 or 1.0
+
+    panel = _render_panel(
+        width=920,
+        height=420,
+        margin_left=70,
+        margin_right=30,
+        margin_top=55,
+        margin_bottom=65,
+        title="Figure 4 — Round-trip loss (fee=0) shrinks with splitting",
+        x_label="Trade size (as % of pool totalPt), buy x PT then sell x PT back",
+        y_label="Round-trip loss (bps of spot notional)",
+        x_range=(xs[0], xs[-1]),
+        y_range=(y_min, y_max + y_pad),
+        series_list=series_list,
+        vlines=[(10.0, "10%")],
+        y_tick_count=6,
+        y_formatter=lambda v: f"{v:.0f}",
+    )
+    svg = _render_svg_document(width=920, height=420, body=panel)
+    _write_svg(out_dir / "pendle-fig4-roundtrip-loss-vs-trade-size-splits.svg", svg)
+
+
+def _generate_fig5(out_dir: Path) -> None:
+    """
+    Figure 5: round-trip loss vs number of splits n (fee=0), to show ~1/n behavior.
+    """
+    py_index = 1.1590929262
+    total_pt = 168_324.7732
+    total_sy = 282_260.1990
+    total_asset = total_sy * py_index
+
+    scalar_root = 10.7165715974
+    last_ln_implied_rate = 0.2103754602
+    time_to_expiry_days = 95.3786
+    time_to_expiry = time_to_expiry_days * 86400
+
+    ns = list(range(1, 201))
+
+    trade_fracs = [0.10, 0.30]
+    colors = ["#2563EB", "#DC2626"]
+
+    series_list: list[Series] = []
+    for frac, color in zip(trade_fracs, colors, strict=True):
+        trade_pt = total_pt * frac
+        pts = [
+            (
+                float(n),
+                _simulate_roundtrip_loss_bps(
+                    total_pt=total_pt,
+                    total_asset=total_asset,
+                    last_ln_implied_rate=last_ln_implied_rate,
+                    scalar_root=scalar_root,
+                    time_to_expiry_seconds=time_to_expiry,
+                    trade_pt=trade_pt,
+                    splits=n,
+                    fee_factor=1.0,
+                ),
+            )
+            for n in ns
+        ]
+        series_list.append(Series(name=f"x={int(frac*100)}%", points=pts, color=color))
+
+    y_all = [y for s in series_list for _, y in s.points]
+    y_min, y_max = 0.0, max(y_all)
+    y_pad = y_max * 0.08 or 1.0
+
+    panel = _render_panel(
+        width=920,
+        height=420,
+        margin_left=70,
+        margin_right=30,
+        margin_top=55,
+        margin_bottom=65,
+        title="Figure 5 — Splitting reduces the non-fee round-trip loss roughly ~1/n",
+        x_label="Number of splits per leg (n)",
+        y_label="Round-trip loss (bps of spot notional)",
+        x_range=(1.0, float(ns[-1])),
+        y_range=(y_min, y_max + y_pad),
+        series_list=series_list,
+        y_tick_count=6,
+        y_formatter=lambda v: f"{v:.0f}",
+    )
+    svg = _render_svg_document(width=920, height=420, body=panel)
+    _write_svg(out_dir / "pendle-fig5-roundtrip-loss-vs-splits.svg", svg)
+
+
+def _generate_fig6(out_dir: Path) -> None:
+    """
+    Figure 6: how time-to-expiry affects the splitting-related round-trip loss (fee=0).
+    """
+    py_index = 1.1590929262
+    total_pt = 168_324.7732
+    total_sy = 282_260.1990
+    total_asset = total_sy * py_index
+
+    scalar_root = 10.7165715974
+    last_ln_implied_rate = 0.2103754602
+
+    trade_frac = 0.10
+    trade_pt = total_pt * trade_frac
+
+    days_min, days_max = 7.0, 730.0
+    days = _linspace(days_min, days_max, 240)
+
+    def curve(splits: int) -> list[tuple[float, float]]:
+        pts: list[tuple[float, float]] = []
+        for d in days:
+            T = d * 86400
+            loss_bps = _simulate_roundtrip_loss_bps(
+                total_pt=total_pt,
+                total_asset=total_asset,
+                last_ln_implied_rate=last_ln_implied_rate,
+                scalar_root=scalar_root,
+                time_to_expiry_seconds=T,
+                trade_pt=trade_pt,
+                splits=splits,
+                fee_factor=1.0,
+            )
+            pts.append((d, loss_bps))
+        return pts
+
+    series_list = [
+        Series(name=f"single (n=1), x={int(trade_frac*100)}%", points=curve(1), color="#111827"),
+        Series(name=f"split (n=10), x={int(trade_frac*100)}%", points=curve(10), color="#2563EB"),
+    ]
+
+    y_all = [y for s in series_list for _, y in s.points]
+    y_min, y_max = 0.0, max(y_all)
+    y_pad = y_max * 0.08 or 1.0
+
+    panel = _render_panel(
+        width=920,
+        height=420,
+        margin_left=70,
+        margin_right=30,
+        margin_top=55,
+        margin_bottom=65,
+        title="Figure 6 — Farther from expiry (larger T) makes the curve steeper and splitting matters more",
+        x_label="Time to expiry (days)",
+        y_label="Round-trip loss (bps of spot notional, fee=0)",
+        x_range=(days_min, days_max),
+        y_range=(y_min, y_max + y_pad),
+        series_list=series_list,
+        y_tick_count=6,
+        y_formatter=lambda v: f"{v:.0f}",
+    )
+    svg = _render_svg_document(width=920, height=420, body=panel)
+    _write_svg(out_dir / "pendle-fig6-roundtrip-loss-vs-time-to-expiry.svg", svg)
+
+
 def main() -> None:
     repo_root = Path(__file__).resolve().parents[2]
     out_dir = repo_root / "reports" / "assets"
@@ -510,12 +901,18 @@ def main() -> None:
     _generate_fig1(out_dir)
     _generate_fig2(out_dir)
     _generate_fig3(out_dir)
+    _generate_fig4(out_dir)
+    _generate_fig5(out_dir)
+    _generate_fig6(out_dir)
 
     print("Generated:")
     for name in [
         "pendle-fig1-ptprice-and-apy-vs-p.svg",
         "pendle-fig2-ptprice-vs-p-different-T.svg",
         "pendle-fig3-yt-per-sy-vs-ptprice.svg",
+        "pendle-fig4-roundtrip-loss-vs-trade-size-splits.svg",
+        "pendle-fig5-roundtrip-loss-vs-splits.svg",
+        "pendle-fig6-roundtrip-loss-vs-time-to-expiry.svg",
     ]:
         print(" -", out_dir / name)
 
