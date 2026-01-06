@@ -83,6 +83,17 @@
 - **`164.808290107408187392 sdPENDLE`**：`AllMight` `0x0000000a3fc396b89e4c11841b39d9dff85a5d05` 转给 `Botmarket`（同 tx 内可见 `sdPENDLE` 从 `0x0` mint 给 `AllMight` 后再转出）
   - tx：`0xb03973035835b48037e216871b0e6675e5b9ea1211ce7f37615f4cae044cd8fd`（2025-12-22 18:06:47 北京）
 
+### 3.0.2 Merkle 分发的“规则”：每个用户怎么知道自己能领多少（以及为什么链上看不出固定比例）
+
+这里的 `MultiMerkleStash` 是典型的 **Merkle Distributor** 设计：链上只存一个 `merkleRoot`（承诺），把“给谁分多少”的明细放在链下。
+
+- 链上校验逻辑很简单：`claim(token, index, account, amount, merkleProof)` 只做 `MerkleProof.verify(proof, merkleRoot[token], keccak(index, account, amount))`，通过就把 `amount` 转给 `account`；**合约本身不计算“按入金比例/权重自动分配”**。
+- 因此，`0x1c0d72...` 能领多少（以及你问的 `claim_amount / Botmarket_inflow` 比例）不是链上固定参数，而是 **每次 update 由分发方在链下生成的分配表决定**（再把 `merkleRoot` 上链）。
+- 经验观察（不构成规则）：在我们抽取的 `update=0x9e/0xa0/0xa2/0xa4/0xa6` 样本里，`claim_amount / Botmarket_inflow` 大致落在 `~36%~38%`，取决于当期分配表中分给该 `account` 的份额。
+- 用户/执行者之所以“知道自己能领多少”，靠的是链下发布的分配数据（常见是前端/API/JSON/IPFS/GitHub 等）：里面会给出 `index/amount/proof`，前端再把这些参数拼进 `claim` 交易里。
+- 可信性来自 `merkleRoot`：你可以用分配表重算 root，并与链上 `MerkleRootUpdated` 事件的 root 对比；对不上就无法在链上通过校验。
+- 这样做的目的主要是减轻链上负担：不用在链上存大表/也不用批量转账；每个领取交易只需 `O(log N)` 的 proof 校验，gas 成本由领取者分摊。
+
 ### 3.1 大额 `DepositReward`（最可能的“跳涨”来源）
 
 - tx：`0xedf67d107fd63918d605726c48817becbbc605692085333edaac6ad853d56d24`
@@ -111,21 +122,20 @@
 
 ## 5. 全局时间线（近30天，UTC+8）
 
-> 时间窗口（按 block timestamp）：`2025-11-28 17:48:35`（block `23896381`）~ `2025-12-28 17:48:35`（block `24110331`）
+> 时间窗口（按 block timestamp）：`2025-12-02 17:36:23`（block `23924925`）~ `2026-01-01 17:36:23`（block `24138923`）
 
 ### 5.1 Botmarket（`0xadfb...`）近30天 `sdPENDLE` 余额变化与关键转账
 
 说明：由于历史 `balanceOf(blockTag)` 在部分 RPC/工具下不稳定，这里用 `sdPENDLE Transfer` 事件做“流水累加”来还原余额变化。
 
-- 窗口起始余额：`5165.5 sdPENDLE`
+- 窗口起始余额：`5378.155686496179363578 sdPENDLE`
 - 窗口结束余额：`2057 sdPENDLE`（当前 `sdPENDLE.balanceOf(0xadfb...)`）
-- 近30天流入：`18537.624424155795452632 sdPENDLE`
-- 近30天流出：`21646.124424155795452632 sdPENDLE`（全部流向 `MultiMerkleStash 0x03e3...`）
-- 净变化：`-3108.5 sdPENDLE`
+- 近30天流入：`20381.968737659616089054 sdPENDLE`
+- 近30天流出：`23703.124424155795452632 sdPENDLE`（全部流向 `MultiMerkleStash 0x03e3...`）
+- 净变化：`-3321.155686496179363578 sdPENDLE`
 
 **入金（外部 → Botmarket）**
 
-- `2025-12-01 21:59:59`：`AllMight 0x0000000a3fc...` → `Botmarket` `212.655686496179363578 sdPENDLE`（tx：`0x9219b9df90065269706897a3ca56317c39436d029d96e65133ffc18815e56d58`）
 - `2025-12-03 05:43:59`：`0x52ea58f4...` → `Botmarket` `5165.5 sdPENDLE`（tx：`0xb8fb880d9b4e58311e7eea01cc9340de8799ad8ba6209f1beeee09939f4e2723`）
 - `2025-12-08 22:07:47`：`AllMight 0x0000000a3fc...` → `Botmarket` `130.637242379906717995 sdPENDLE`（tx：`0x32d59c6bf4eb83eee630b814be4e7c555598886eb565a17e13f16d9b01e1d74e`）
 - `2025-12-09 23:55:11`：`0x52ea58f4...` → `Botmarket` `5165.5 sdPENDLE`（tx：`0xe74b4578d7ae86aea6f06b1963687accd75345d70dfcde838461d1c91795117e`）
@@ -133,6 +143,7 @@
 - `2025-12-16 21:48:11`：`0x52ea58f4...` → `Botmarket` `5165.5 sdPENDLE`（tx：`0xc718a2c83d5cb77175a9b58f212a4a13cb1e71ca65b8f3a6a40a3a73c4b1db15`）
 - `2025-12-22 18:06:47`：`AllMight 0x0000000a3fc...` → `Botmarket` `164.808290107408187392 sdPENDLE`（tx：`0xb03973035835b48037e216871b0e6675e5b9ea1211ce7f37615f4cae044cd8fd`）
 - `2025-12-23 18:55:35`：`0x52ea58f4...` → `Botmarket` `2057 sdPENDLE`（tx：`0x9e152fb01d7e951f213d146de57c17ee6dd45b2d5783089d9cd091b32b149511`）
+- `2025-12-30 23:06:59`：`0x52ea58f4...` → `Botmarket` `2057 sdPENDLE`（tx：`0x1e251e5c5ac2af6e8eb5d2661d86ca903214afe4e3b21e8411da9241932f2d26`）
 
 **出金（Botmarket → MultiMerkleStash，Merkle 奖励池入金）**
 
@@ -140,8 +151,9 @@
 - `2025-12-09 17:28:23`：`update=0xa0`，`5296.137242379906717995 sdPENDLE`（tx：`0x242cf56995464b262387c46504a2d239c239f6fb053bdb1b194a6d17f1c64281`）
 - `2025-12-16 17:19:59`：`update=0xa2`，`5641.523205172301183667 sdPENDLE`（tx：`0x98f6fc12788a0d04507e6752a33905ca641009f4e25cf0ece3283e86b6b412ab`）
 - `2025-12-23 17:23:59`：`update=0xa4`，`5330.308290107408187392 sdPENDLE`（tx：`0xae6c6eee816b7a99ab66dc927bcab60fe9b579ac55da75c1dc3c85bdea892988`）
+- `2025-12-30 17:58:23`：`update=0xa6`，`2057 sdPENDLE`（tx：`0x0f9622d8b236db44c4af611ba79304c9affbd3bce6cb5e20ed5f8da6341134a2`）
 
-> 观察：每次入金的金额都可以拆成 `5165.5 + X`，其中 `5165.5` 来自 `0x52ea...` 的周期性转账，`X` 来自 `AllMight` 的补差额（同 tx 内常可见 `sdPENDLE` 从 `0x0` mint 给 `AllMight` 后再转出）。
+> 观察：`update=0x9e/0xa0/0xa2/0xa4` 的入金金额都可以拆成 `5165.5 + X`，其中 `5165.5` 来自 `0x52ea...` 的周期性转账，`X` 来自 `AllMight` 的补差额（同 tx 内常可见 `sdPENDLE` 从 `0x0` mint 给 `AllMight` 后再转出）；但 `update=0xa6` 本次入金仅 `2057`，不满足该拆分。
 
 ### 5.2 Merkle 奖励入账 → `asdPENDLE` 升值（exchangeRate 跳涨）时间线
 
@@ -164,8 +176,11 @@
 - `update=0xa4`（你关注的 12/24 跳涨，详见上面 Case）
   - `2025-12-24 11:18:23`：`claim` 转入 burner `1948.521452029240208503 sdPENDLE`（tx：`0x3ffae07496c1921b952d51dbdb9905946bdc69e79d9fc3b509634ac73b9ea866`）
   - `2025-12-24 11:18:35`：`burn` → `DepositReward` `1558.817161623392166803 sdPENDLE`（tx：`0xedf67d107fd63918d605726c48817becbbc605692085333edaac6ad853d56d24`）
+- `update=0xa6`
+  - `2025-12-31 21:39:11`：`claim` 转入 burner `787.861635830934915248 sdPENDLE`（tx：`0x1da0ab75230b0e39b9e98754781a3f14742c96b9e51e8d771e5448aa2058f354`）
+  - `2025-12-31 21:39:23`：`burn` → `DepositReward` `630.289308664747932200 sdPENDLE`（tx：`0x03019cd5d0a8f514f2a2666826953fede9e81c9cb7b22eb2039d39bf8365741f`）
 
-> 观察：这 4 次跳涨里，`DepositReward` 都精准满足 `≈ claim_amount * 80%`，与 burner 的 `10% + 10% + 80%` 拆分逻辑一致；因此“偶尔突然一大笔”，本质就是上游 `claim` 把一段时间累计的 Merkle 奖励一次性结算进来，然后被 burner 一次性 `depositReward` 到 vault。 
+> 观察：这 5 次跳涨里，`DepositReward` 都精准满足 `≈ claim_amount * 80%`，与 burner 的 `10% + 10% + 80%` 拆分逻辑一致；因此“偶尔突然一大笔”，本质就是上游 `claim` 把一段时间累计的 Merkle 奖励一次性结算进来，然后被 burner 一次性 `depositReward` 到 vault。 
 
 ---
 
